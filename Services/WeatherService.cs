@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using Microsoft.Extensions.Logging;
 using WeatherApi.Models;
 
 namespace WeatherApi.Services
@@ -8,29 +9,54 @@ namespace WeatherApi.Services
         private readonly HttpClient _httpClient;
         private readonly string _apiKey;
         private readonly string _apiBaseUrl;
+        private readonly ICacheService _cache;
+        private readonly ILogger<WeatherService> _logger;
 
-        public WeatherService(HttpClient httpClient, string apiKey, string apiBaseUrl)
+        public WeatherService(
+            HttpClient httpClient, 
+            string apiKey, 
+            string apiBaseUrl,
+            ICacheService cache,
+            ILogger<WeatherService> logger)
         {
             _httpClient = httpClient;
             _apiKey = apiKey;
             _apiBaseUrl = apiBaseUrl;
+            _cache = cache;
+            _logger = logger;
         }
 
         public async Task<WeatherForecast> GetCurrentWeatherAsync(string city)
         {
-            try
+            var cacheKey = $"weather:current:{city.ToLower()}";
+            
+            var cached = await _cache.GetAsync<WeatherForecast>(cacheKey);
+            if (cached != null)
             {
-                var response = await GetForecastAsync(city, 1);
-                return response.FirstOrDefault() ?? throw new Exception("No weather data found");
+                _logger.LogInformation("Cache hit for current weather in {City}", city);
+                return cached;
             }
-            catch (Exception ex)
-            {
-                throw new Exception($"Error fetching current weather data: {ex.Message}", ex);
-            }
+
+            var forecast = await GetForecastAsync(city, 1);
+            var current = forecast.FirstOrDefault() ?? throw new Exception("No weather data found");
+            
+            // Cache for 15 minutes since it's current weather
+            await _cache.SetAsync(cacheKey, current, TimeSpan.FromMinutes(15));
+            
+            return current;
         }
 
         public async Task<IEnumerable<WeatherForecast>> GetForecastAsync(string city, int days = 7)
         {
+            var cacheKey = $"weather:forecast:{city.ToLower()}:{days}";
+            
+            var cached = await _cache.GetAsync<IEnumerable<WeatherForecast>>(cacheKey);
+            if (cached != null)
+            {
+                _logger.LogInformation("Cache hit for forecast in {City} for {Days} days", city, days);
+                return cached;
+            }
+
             try
             {
                 // Construct URL for Visual Crossing API
@@ -55,7 +81,12 @@ namespace WeatherApi.Services
                 if (apiResponse?.Days == null || !apiResponse.Days.Any())
                     throw new Exception("No weather data found in API response");
 
-                return MapToWeatherForecasts(apiResponse.Days.Take(days));
+                var forecasts = MapToWeatherForecasts(apiResponse.Days.Take(days));
+                
+                // Cache forecast for 1 hour
+                await _cache.SetAsync(cacheKey, forecasts, TimeSpan.FromHours(1));
+                
+                return forecasts;
             }
             catch (HttpRequestException ex)
             {
